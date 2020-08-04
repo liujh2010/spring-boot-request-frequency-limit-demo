@@ -1,6 +1,5 @@
 package com.example.limitreq.util;
 
-
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
 import org.springframework.web.servlet.mvc.method.RequestMappingInfo;
@@ -10,14 +9,16 @@ import java.util.*;
 
 public class RequestMappingMatcher {
     private final MultiValueMap<String, RequestMappingInfo> urlLookup = new LinkedMultiValueMap<>();
-    private final List<RequestMappingInfo> mappingLookup = new ArrayList<>();
+    private final Map<RequestMappingInfo, Boolean> mappingLookup = new LinkedHashMap<>();
 
-    public void registerMapping(RequestMappingInfo mapping) {
-        mappingLookup.add(mapping);
+    public void registerMapping(RequestMappingInfo mapping, boolean matching) {
+        mappingLookup.put(mapping, matching);
 
-        for (String url : mapping.getPatternsCondition().getPatterns()) {
-            if (this.isPattern(url)) {
-                urlLookup.add(url, mapping);
+        if (matching) {
+            for (String url : mapping.getPatternsCondition().getPatterns()) {
+                if (!this.isPattern(url)) {
+                    urlLookup.add(url, mapping);
+                }
             }
         }
     }
@@ -26,6 +27,7 @@ public class RequestMappingMatcher {
         List<RequestMappingInfo> matches = new ArrayList<>();
         String lookupPath = request.getServletPath();
         List<RequestMappingInfo> directPathMatches = this.getMappingInfosByUrl(lookupPath);
+
         if (directPathMatches != null) {
             this.addMatchingMapping(directPathMatches, matches, request);
         }
@@ -36,16 +38,19 @@ public class RequestMappingMatcher {
 
         if (!matches.isEmpty()) {
             RequestMappingInfo bastMatch = matches.get(0);
+
             if (matches.size() > 1) {
                 Comparator<RequestMappingInfo> comparator = (info1, info2) -> info1.compareTo(info2, request);
                 matches.sort(comparator);
                 bastMatch = matches.get(0);
                 RequestMappingInfo secondMatch = matches.get(0);
+
                 if (comparator.compare(bastMatch, secondMatch) == 0) {
                     return null;
                 }
             }
-            return bastMatch;
+
+            return mappingLookup.get(bastMatch) ? bastMatch : null;
         } else {
             return null;
         }
@@ -74,7 +79,7 @@ public class RequestMappingMatcher {
         }
     }
 
-    private void addMatchingMapping(List<RequestMappingInfo> mappings, List<RequestMappingInfo> matches, HttpServletRequest request) {
+    private void addMatchingMapping(Collection<RequestMappingInfo> mappings, List<RequestMappingInfo> matches, HttpServletRequest request) {
         Iterator<RequestMappingInfo> iterator = mappings.iterator();
 
         for (; iterator.hasNext(); ) {
@@ -87,11 +92,12 @@ public class RequestMappingMatcher {
 
     }
 
-    private List<RequestMappingInfo> getAllMappings() {
-        return mappingLookup;
+    private Collection<RequestMappingInfo> getAllMappings() {
+        return mappingLookup.keySet();
     }
 
     private List<RequestMappingInfo> getMappingInfosByUrl(String lockupPath) {
         return urlLookup.get(lockupPath);
     }
 }
+

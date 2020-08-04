@@ -35,10 +35,10 @@ public class RequestFrequencyLimitFilter implements Filter {
     @Autowired
     private WebApplicationContext applicationContext;
 
-    @Value("${ip-request-limit.limit-list.check-cycle}")
+    @Value("${request-limit.limit-list.check-cycle}")
     private static int checkCycle = 300000;
 
-    @Value("${ip-request-limit.remote-host.head-type}")
+    @Value("${request-limit.http-remote-host-head.type}")
     private static String remoteHostHeadTypeStr = "default";
 
     private class RequestLimitRecord {
@@ -95,11 +95,13 @@ public class RequestFrequencyLimitFilter implements Filter {
         for (Map.Entry<RequestMappingInfo, HandlerMethod> entry : map.entrySet()) {
             RequestMappingInfo info = entry.getKey();
             RequestFrequencyLimit limit = entry.getValue().getMethod().getAnnotation(RequestFrequencyLimit.class);
+            boolean matching = false;
 
             if (limit != null) {
                 this.register(info, limit.value());
-                mappingMatcher.registerMapping(info);
+                matching = true;
             }
+            mappingMatcher.registerMapping(info, matching);
         }
 
     }
