@@ -1,10 +1,7 @@
 package com.example.limitreq.controllers;
 
 import com.example.limitreq.annotation.RequestFrequencyLimit;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
 
 @RestController
 @RequestMapping("test")
@@ -17,13 +14,19 @@ public class HelloWorldController {
     }
 
     @RequestFrequencyLimit(9000)
-    @PostMapping("fuck")
+    @PostMapping("hi")
     public String sayFuck() {
-        return "Fuck!";
+        return "Hi!";
     }
 
     @GetMapping("yeah")
     public String sayYeah() {
         return "Yeah!";
+    }
+
+    @RequestFrequencyLimit(15000)
+    @GetMapping("talk/{something}/right")
+    public String sayShit(@PathVariable String something) {
+        return "You say " + something + " right.";
     }
 }

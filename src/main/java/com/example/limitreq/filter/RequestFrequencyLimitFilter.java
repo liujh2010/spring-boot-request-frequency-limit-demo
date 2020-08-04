@@ -1,6 +1,7 @@
 package com.example.limitreq.filter;
 
 import com.example.limitreq.annotation.RequestFrequencyLimit;
+import com.example.limitreq.util.RequestMappingMatcher;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
@@ -17,20 +18,22 @@ import java.io.PrintWriter;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Component
 public class RequestFrequencyLimitFilter implements Filter {
-    @Autowired
-    private WebApplicationContext applicationContext;
     private final static Object checkLock = new Object();
     private final static Object putLock = new Object();
-    private final static Map<String, Integer> apiLimitFreqMap = new HashMap<>();
-    private final static Map<RequestRecord, Long> limitList = new ConcurrentHashMap<>(3000);
+    private final static Map<RequestMappingInfo, RequestLimitInfo> apiInfoFrequencyLookup = new HashMap<>();
+    private final static Map<String, Integer> apiPathFrequencyLookup = new HashMap<>();
+    private final static Map<RequestLimitRecord, Long> limitLookup = new ConcurrentHashMap<>(3000);
+    private final static RequestMappingMatcher mappingMatcher = new RequestMappingMatcher();
     private volatile static long lastCheckTime;
     private volatile static boolean notChecking = true;
     private static int remoteHostHeadType = 0;
+
+    @Autowired
+    private WebApplicationContext applicationContext;
 
     @Value("${ip-request-limit.limit-list.check-cycle}")
     private static int checkCycle = 300000;
@@ -38,28 +41,38 @@ public class RequestFrequencyLimitFilter implements Filter {
     @Value("${ip-request-limit.remote-host.head-type}")
     private static String remoteHostHeadTypeStr = "default";
 
-    private class RequestRecord {
+    private class RequestLimitRecord {
         public final String url;
         public final String ip;
-        private final String hashStr;
+        private final int hashCode;
 
-        public RequestRecord(String url, String ip) {
+        public RequestLimitRecord(String url, String ip) {
             this.url = url;
             this.ip = ip;
-            hashStr = url + ip;
+            hashCode = (url + ip).hashCode();
         }
 
         @Override
         public int hashCode() {
-            return hashStr.hashCode();
+            return hashCode;
         }
 
         @Override
         public boolean equals(Object obj) {
             if (this == obj) return true;
-            if (!(obj instanceof RequestRecord)) return false;
-            RequestRecord record = (RequestRecord) obj;
+            if (!(obj instanceof RequestLimitRecord)) return false;
+            RequestLimitRecord record = (RequestLimitRecord) obj;
             return record.url.equals(url) && record.ip.equals(ip);
+        }
+    }
+
+    private class RequestLimitInfo {
+        public final int frequency;
+        public final String apiPath;
+
+        public RequestLimitInfo(int frequency, String apiPath) {
+            this.frequency = frequency;
+            this.apiPath = apiPath;
         }
     }
 
@@ -78,43 +91,48 @@ public class RequestFrequencyLimitFilter implements Filter {
 
         RequestMappingHandlerMapping mapping = applicationContext.getBean(RequestMappingHandlerMapping.class);
         Map<RequestMappingInfo, HandlerMethod> map = mapping.getHandlerMethods();
+
         for (Map.Entry<RequestMappingInfo, HandlerMethod> entry : map.entrySet()) {
-            Set<String> urls = entry.getKey().getPatternsCondition().getPatterns();
+            RequestMappingInfo info = entry.getKey();
             RequestFrequencyLimit limit = entry.getValue().getMethod().getAnnotation(RequestFrequencyLimit.class);
+
             if (limit != null) {
-                register(urls, limit.value());
+                this.register(info, limit.value());
+                mappingMatcher.registerMapping(info);
             }
         }
+
     }
 
     @Override
     public void doFilter(ServletRequest servletRequest, ServletResponse servletResponse, FilterChain filterChain) throws IOException, ServletException {
         if (notChecking && (System.currentTimeMillis() - lastCheckTime) >= checkCycle) {
-            if (checking()) {
-                checkLimitList();
+            if (this.checking()) {
+                this.checkLimitLookup();
                 lastCheckTime = System.currentTimeMillis();
-                checked();
+                this.checked();
             }
         }
 
         HttpServletRequest request = (HttpServletRequest) servletRequest;
         HttpServletResponse response = (HttpServletResponse) servletResponse;
+        RequestMappingInfo info = mappingMatcher.lockupRequestMappingInfo(request);
 
-        String uri = request.getServletPath();
-        Integer apiFrequency = getApiFrequency(uri);
-        if (apiFrequency == null) {
+        if (info == null) {
             filterChain.doFilter(servletRequest, servletResponse);
         } else {
-            String ip = getRemoteHost(request);
-            RequestRecord record = new RequestRecord(uri, ip);
-            Long lastRequestTime = getLastRequestTime(record);
-            if (lastRequestTime != null && notExpired(lastRequestTime, apiFrequency)) {
-                writeErrorResponse(response, lastRequestTime, apiFrequency);
+            RequestLimitInfo limitInfo = this.getApiFrequency(info);
+            RequestLimitRecord record = new RequestLimitRecord(limitInfo.apiPath, this.getRemoteHost(request));
+            Long lastRequestTime = this.getLastRequestTime(record);
+
+            if (lastRequestTime != null && this.notExpired(lastRequestTime, limitInfo.frequency)) {
+                this.writeErrorResponse(response, lastRequestTime, limitInfo.frequency);
             } else {
-                response.addHeader("x-rate-limit-frequency", apiFrequency + "ms");
+                response.addHeader("x-rate-limit-frequency", limitInfo.frequency + "ms");
                 filterChain.doFilter(servletRequest, servletResponse);
-                updateLimitList(record, System.currentTimeMillis());
+                this.updateLimitList(record, System.currentTimeMillis());
             }
+
         }
     }
 
@@ -129,6 +147,7 @@ public class RequestFrequencyLimitFilter implements Filter {
                 notChecking = false;
                 return true;
             }
+
             return false;
         }
     }
@@ -137,25 +156,27 @@ public class RequestFrequencyLimitFilter implements Filter {
         notChecking = true;
     }
 
-    private Integer getApiFrequency(Object object) {
-        return apiLimitFreqMap.get(object);
+    private RequestLimitInfo getApiFrequency(Object object) {
+        return apiInfoFrequencyLookup.get(object);
     }
 
-    private void updateLimitList(RequestRecord record, Long lastRequestTime) {
+    private void updateLimitList(RequestLimitRecord record, Long lastRequestTime) {
         synchronized (putLock) {
-            Long oldLastRequestTime = limitList.get(record);
+            Long oldLastRequestTime = limitLookup.get(record);
+
             if (oldLastRequestTime == null || oldLastRequestTime < lastRequestTime) {
-                limitList.put(record, lastRequestTime);
+                limitLookup.put(record, lastRequestTime);
             }
         }
     }
 
-    private Long getLastRequestTime(RequestRecord record) {
-        return limitList.get(record);
+    private Long getLastRequestTime(RequestLimitRecord record) {
+        return limitLookup.get(record);
     }
 
     private String getRemoteHost(HttpServletRequest request) {
         String host = "";
+
         switch (remoteHostHeadType) {
             case 1:
                 host = request.getHeader("X-Real-IP");
@@ -166,15 +187,17 @@ public class RequestFrequencyLimitFilter implements Filter {
             default:
                 host = request.getRemoteHost();
         }
+
         return host;
     }
 
-    private boolean notExpired(Long lastRequestTime, Integer frequency) {
+    private boolean notExpired(Long lastRequestTime, int frequency) {
         return (System.currentTimeMillis() - lastRequestTime) < frequency;
     }
 
-    private void writeErrorResponse(HttpServletResponse response, Long lastRequestTime, Integer apiFrequency) {
+    private void writeErrorResponse(HttpServletResponse response, Long lastRequestTime, int apiFrequency) {
         PrintWriter out = null;
+
         try {
             response.addHeader("retry-after", (apiFrequency - (System.currentTimeMillis() - lastRequestTime)) + "ms");
             response.setStatus(429);
@@ -187,24 +210,28 @@ public class RequestFrequencyLimitFilter implements Filter {
                 out.close();
             }
         }
+
     }
 
-    private void register(Set<String> urls, int frequency) {
-        for (String url : urls) {
-            apiLimitFreqMap.put(url, frequency);
-        }
+    private void register(RequestMappingInfo info, int frequency) {
+        String apiDirectPath = info.getPatternsCondition().getPatterns().iterator().next();
+        apiInfoFrequencyLookup.put(info, new RequestLimitInfo(frequency, apiDirectPath));
+        apiPathFrequencyLookup.put(apiDirectPath, frequency);
     }
 
-    private void checkLimitList() {
+    private void checkLimitLookup() {
         Long now = System.currentTimeMillis();
-        Iterator<Map.Entry<RequestRecord, Long>> iterator = limitList.entrySet().iterator();
+        Iterator<Map.Entry<RequestLimitRecord, Long>> iterator = limitLookup.entrySet().iterator();
+
         for (; iterator.hasNext(); ) {
-            Map.Entry<RequestRecord, Long> item = iterator.next();
+            Map.Entry<RequestLimitRecord, Long> item = iterator.next();
+            RequestLimitRecord record = item.getKey();
             Long lastRequestTime = item.getValue();
-            Integer frequency = apiLimitFreqMap.get(item.getKey().url);
+            Integer frequency = apiPathFrequencyLookup.get(record.url);
             if ((now - lastRequestTime) >= frequency) {
-                limitList.remove(item.getKey());
+                limitLookup.remove(record);
             }
         }
+
     }
 }
