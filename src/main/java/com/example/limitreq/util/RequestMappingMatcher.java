@@ -84,9 +84,9 @@ public class RequestMappingMatcher {
 
         for (; iterator.hasNext(); ) {
             RequestMappingInfo mapping = iterator.next();
-            RequestMappingInfo match = mapping.getMatchingCondition(request);
-            if (match != null) {
-                matches.add(match);
+
+            if (mapping.getMatchingCondition(request) != null) {
+                matches.add(mapping);
             }
         }
 
